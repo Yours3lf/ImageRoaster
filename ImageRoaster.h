@@ -27,6 +27,7 @@
 //-if can't compress tile (ie. output bpp = input bpp), don't write out minvalue, just write out bpp and full tile data
 //-if min=max then just write out special value, so we only need to write minvalue
 //-implement phase 2 where instead of next pow2 bit depths are used, exact bit depths are used
+//-get rid of 2x2 mode. too much overhead
 
 class ImageRoaster
 {
@@ -162,7 +163,8 @@ public:
 		}
 	}
 
-	void compressImage(std::vector<uint8_t> &resBuf, const uint8_t *data, uint32_t bitDepthPerChannel, uint32_t channels, uint32_t width, uint32_t height, uint32_t tileSize)
+	template<typename T>
+	void compressImage(std::vector<uint8_t> &resBuf, const T *data, uint32_t bitDepthPerChannel, uint32_t channels, uint32_t width, uint32_t height, uint32_t tileSize)
 	{
 		auto start = std::chrono::system_clock::now();
 
@@ -180,108 +182,123 @@ public:
 		std::chrono::microseconds minmaxSearchTime = std::chrono::microseconds(0);
 		std::chrono::microseconds storeTime = std::chrono::microseconds(0);
 
-		auto compressCore = [&]<typename T>()
+		const T *pixels = (const T *)data;
+
+		// we cache tile pixels during minmax value search so that we don't pay cache misses twice
+		// accessing the rows of a tile
+		std::vector<T> tilePixels;
+		tilePixels.resize(tileSize * tileSize * channels);
+
+		// seems to help the compiler realise it should really pull some memory into cache
+		std::vector<T> strideCache;
+		strideCache.resize(tileSize * channels);
+
+		for (uint32_t y = 0; y < height; y += tileSize)
 		{
-			const T *pixels = (const T *)data;
-
-			// we cache tile pixels during minmax value search so that we don't pay cache misses twice
-			// accessing the rows of a tile
-			std::vector<T> tilePixels;
-			tilePixels.resize(tileSize * tileSize * channels);
-
-			// seems to help the compiler realise it should really pull some memory into cache
-			std::vector<T> strideCache;
-			strideCache.resize(tileSize * channels);
-
-			for (uint32_t y = 0; y < height; y += tileSize)
+			for (uint32_t x = 0; x < width; x += tileSize)
 			{
-				for (uint32_t x = 0; x < width; x += tileSize)
+				auto minmaxSearchStart = std::chrono::system_clock::now();
+
+				// figure out smallest and largest value per channel
+				T minValue[channels];
+				T maxValue[channels];
+				for (uint32_t c = 0; c < channels; ++c)
 				{
-					auto minmaxSearchStart = std::chrono::system_clock::now();
+					minValue[c] = ~T(0);
+					maxValue[c] = 0;
+				}
 
-					// figure out smallest and largest value per channel
-					T minValue[channels];
-					T maxValue[channels];
-					for (uint32_t c = 0; c < channels; ++c)
+				for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+				{
+					memcpy(strideCache.data(), &pixels[(yb * width + x) * channels + 0], strideCache.size() * sizeof(T));
+					for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
 					{
-						minValue[c] = ~T(0);
-						maxValue[c] = 0;
+						for (uint32_t c = 0; c < channels; ++c)
+						{
+							T pixel = strideCache[xx * channels + c];
+
+							tilePixels[(yy * tileSize + xx) * channels + c] = pixel;
+
+							minValue[c] = std::min(pixel, minValue[c]);
+							maxValue[c] = std::max(pixel, maxValue[c]);
+						}
+					}
+				}
+
+				auto minmaxSearchEnd = std::chrono::system_clock::now();
+				minmaxSearchTime += std::chrono::duration_cast<std::chrono::microseconds>(minmaxSearchEnd - minmaxSearchStart);
+
+				auto storeStart = std::chrono::system_clock::now();
+
+				for (uint32_t c = 0; c < channels; c++)
+				{
+					uint32_t tileBpp = 0;
+					{
+						uint32_t diff = maxValue[c] - minValue[c];
+
+						while (diff != 0)
+						{
+							diff >>= 1;
+							tileBpp++;
+						}
+
+						if (tileBpp == 0)
+							tileBpp = 1;
+
+						auto nextPow2 = [](uint32_t v)
+						{
+							v--;
+							v |= v >> 1;
+							v |= v >> 2;
+							v |= v >> 4;
+							v |= v >> 8;
+							v |= v >> 16;
+							v++;
+							return v;
+						};
+
+						tileBpp = nextPow2(tileBpp);
 					}
 
-					for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+					T maxVal = (uint32_t(1) << tileBpp) - 1;
+
+					uint32_t currSize = resBuf.size();
+					if (tileBpp == 1 && tileSize == 2)
 					{
-						memcpy(strideCache.data(), &pixels[(yb * width + x) * channels + 0], strideCache.size() * sizeof(T));
-						for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
+						resBuf.resize(currSize + sizeof(uint8_t) + sizeof(T));
+					}
+					else
+					{
+						resBuf.resize(currSize + ((tileSize * tileSize * tileBpp) >> 3) + sizeof(uint8_t) + sizeof(T));
+					}
+
+					*(T *)(resBuf.data() + currSize) = minValue[c];
+					*(uint8_t *)(resBuf.data() + currSize + sizeof(T)) = (tileBpp - 1) & 0xf; // bpp stored in lower 4 bits
+
+					// we support 2x2 tiles if we store the req bit depth in 4 bits
+					// and in case of a 1bpp tile store the tile in the next 4 bits
+					// as a special case...
+					if (tileBpp == 1 && tileSize == 2)
+					{
+						uint8_t *tileData = (uint8_t *)(resBuf.data() + currSize + sizeof(T));
+
+						uint32_t counter = 0;
+						for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
 						{
-							for (uint32_t c = 0; c < channels; ++c)
+							for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
 							{
-								T pixel = strideCache[xx * channels + c];
-
-								tilePixels[(yy * tileSize + xx) * channels + c] = pixel;
-
-								minValue[c] = std::min(pixel, minValue[c]);
-								maxValue[c] = std::max(pixel, maxValue[c]);
+								// T pixel = pixels[(yb * width + xb) * channels + c];
+								T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
+								uint8_t pixelDiff = pixel - minValue[c];
+								uint8_t dataToStore = (pixelDiff & maxVal) << (4 + counter++);
+								*tileData = *tileData | dataToStore; // store data in upper 4 bits
 							}
 						}
 					}
-
-					auto minmaxSearchEnd = std::chrono::system_clock::now();
-					minmaxSearchTime += std::chrono::duration_cast<std::chrono::microseconds>(minmaxSearchEnd - minmaxSearchStart);
-
-					auto storeStart = std::chrono::system_clock::now();
-
-					for (uint32_t c = 0; c < channels; c++)
+					else
 					{
-						uint32_t tileBpp = 0;
+						auto compressTile = [&]<typename D>()
 						{
-							uint32_t diff = maxValue[c] - minValue[c];
-
-							while (diff != 0)
-							{
-								diff >>= 1;
-								tileBpp++;
-							}
-
-							if (tileBpp == 0)
-								tileBpp = 1;
-
-							auto nextPow2 = [](uint32_t v)
-							{
-								v--;
-								v |= v >> 1;
-								v |= v >> 2;
-								v |= v >> 4;
-								v |= v >> 8;
-								v |= v >> 16;
-								v++;
-								return v;
-							};
-
-							tileBpp = nextPow2(tileBpp);
-						}
-
-						T maxVal = (uint32_t(1) << tileBpp) - 1;
-
-						uint32_t currSize = resBuf.size();
-						if (tileBpp == 1 && tileSize == 2)
-						{
-							resBuf.resize(currSize + sizeof(uint8_t) + sizeof(T));
-						}
-						else
-						{
-							resBuf.resize(currSize + ((tileSize * tileSize * tileBpp) >> 3) + sizeof(uint8_t) + sizeof(T));
-						}
-
-						*(T *)(resBuf.data() + currSize) = minValue[c];
-						*(uint8_t *)(resBuf.data() + currSize + sizeof(T)) = (tileBpp - 1) & 0xf; // bpp stored in lower 4 bits
-
-						// we support 2x2 tiles if we store the req bit depth in 4 bits
-						// and in case of a 1bpp tile store the tile in the next 4 bits
-						// as a special case...
-						if (tileBpp == 1 && tileSize == 2)
-						{
-							uint8_t *tileData = (uint8_t *)(resBuf.data() + currSize + sizeof(T));
-
 							uint32_t counter = 0;
 							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
 							{
@@ -289,65 +306,38 @@ public:
 								{
 									// T pixel = pixels[(yb * width + xb) * channels + c];
 									T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
-									uint8_t pixelDiff = pixel - minValue[c];
-									uint8_t dataToStore = (pixelDiff & maxVal) << (4 + counter++);
-									*tileData = *tileData | dataToStore; // store data in upper 4 bits
+									T pixelDiff = pixel - minValue[c];
+
+									D *currData = (D *)(resBuf.data() + currSize + sizeof(T) + sizeof(uint8_t) + (counter >> 3));
+
+									if (counter % (sizeof(D) * 8) == 0)
+									{
+										*currData = 0;
+									}
+
+									D dataToStore = D(pixelDiff & maxVal) << (counter % (sizeof(D) * 8));
+
+									*currData = *currData | dataToStore;
+
+									counter += tileBpp;
 								}
 							}
+						};
+
+						if (tileBpp <= 8)
+						{
+							compressTile.template operator()<uint8_t>();
 						}
 						else
 						{
-							auto compressTile = [&]<typename D>()
-							{
-								uint32_t counter = 0;
-								for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
-								{
-									for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-									{
-										// T pixel = pixels[(yb * width + xb) * channels + c];
-										T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
-										T pixelDiff = pixel - minValue[c];
-
-										D *currData = (D *)(resBuf.data() + currSize + sizeof(T) + sizeof(uint8_t) + (counter >> 3));
-
-										if (counter % (sizeof(D) * 8) == 0)
-										{
-											*currData = 0;
-										}
-
-										D dataToStore = D(pixelDiff & maxVal) << (counter % (sizeof(D) * 8));
-
-										*currData = *currData | dataToStore;
-
-										counter += tileBpp;
-									}
-								}
-							};
-
-							if (tileBpp <= 8)
-							{
-								compressTile.template operator()<uint8_t>();
-							}
-							else
-							{
-								compressTile.template operator()<uint16_t>();
-							}
+							compressTile.template operator()<uint16_t>();
 						}
 					}
-
-					auto storeEnd = std::chrono::system_clock::now();
-					storeTime += std::chrono::duration_cast<std::chrono::microseconds>(storeEnd - storeStart);
 				}
-			}
-		};
 
-		if (bitDepthPerChannel <= 8)
-		{
-			compressCore.template operator()<uint8_t>();
-		}
-		else
-		{
-			compressCore.template operator()<uint16_t>();
+				auto storeEnd = std::chrono::system_clock::now();
+				storeTime += std::chrono::duration_cast<std::chrono::microseconds>(storeEnd - storeStart);
+			}
 		}
 
 		auto end = std::chrono::system_clock::now();
@@ -359,8 +349,9 @@ public:
 			std::cout << "Store elapsed time: " << storeTime << std::endl;
 			std::cout << "Compression elapsed time: " << elapsed << std::endl;
 			uint32_t inputSize = (width * height * channels * (bitDepthPerChannel <=8 ? 1 : 2));
-			std::cout << "Input size: " << inputSize << "B, output size:" << resBuf.size() << std::endl;
-			std::cout << "Compression ratio: " << uint32_t(float(resBuf.size()) / float(inputSize) * 100.0f) << "%" << std::endl;
+			std::cout << "Input size: " << inputSize << " bytes" << std::endl;
+			std::cout << "Output size: " << resBuf.size() << " bytes" << std::endl;
+			std::cout << "Compression ratio: " << uint32_t(float(resBuf.size()) / float(inputSize) * 100.0f) << "% of original" << std::endl;
 		}
 	}
 };
