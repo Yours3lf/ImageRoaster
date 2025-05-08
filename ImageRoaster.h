@@ -15,7 +15,6 @@
 //		we calc the diff between min/max and the req bit depth, store it in the next 4bits (eg. 1, 2, 4, 8, 16)
 //		for each pixel we just store the diff between mini value and current pixel
 
-// TODO:
 // Compressing an image stream exploiting temporal coherence:
 // Store seq number
 // 0 means full frame
@@ -23,11 +22,8 @@
 // If diff between current tile and seq 0 becomes too big (eg bigger bit per pixel requirement than tile seq 0), reset seq to 0 and set full frame
 
 // TODO:
-//-pack metadata more
-//-if can't compress tile (ie. output bpp = input bpp), don't write out minvalue, just write out bpp and full tile data
-//-if min=max then just write out special value, so we only need to write minvalue
 //-implement phase 2 where instead of next pow2 bit depths are used, exact bit depths are used
-//-get rid of 2x2 mode. too much overhead
+//-implement temporal compression
 
 class ImageRoaster
 {
@@ -67,14 +63,18 @@ public:
 		auto start = std::chrono::system_clock::now();
 
 		uint32_t *ptr32 = (uint32_t *)buf.data();
+		uint16_t *ptr16 = (uint16_t *)buf.data();
 
 		uint32_t width = ptr32[0];
 		uint32_t height = ptr32[1];
-		uint32_t channels = ptr32[2];
-		uint32_t bitDepthPerChannel = ptr32[3];
-		uint32_t tileSize = ptr32[4];
 
-		uint32_t tileOffset = 5 * sizeof(uint32_t);
+		uint32_t bitDepthPerChannel = ((ptr16[4]) & 0x3f) + 1;
+		uint32_t tileSize = ((ptr16[4] >> 6) & 0x3f) + 1;
+		uint32_t channels = ((ptr16[4] >> 12) & 0xf) + 1;
+
+		assert(tileSize >= 4);
+
+		uint32_t tileOffset = 2 * sizeof(uint32_t) + sizeof(uint16_t);
 
 		auto decompressCore = [&]<typename T>()
 		{
@@ -86,56 +86,92 @@ public:
 				{
 					for (uint32_t c = 0; c < channels; ++c)
 					{
-						T minValue = *(T *)(buf.data() + tileOffset);
-						uint8_t tileBpp = ((*(uint8_t *)(buf.data() + tileOffset + sizeof(T))) & 0xf) + 1;
+						uint8_t metadata = *(uint8_t *)(buf.data() + tileOffset);
+						uint32_t tileBpp = (metadata & 0x3f) + 1;
+						bool allTilePixelsSame = (metadata >> 6) & 0x1;
+						bool fullOrDiffFrame = (metadata >> 7) & 0x1;
 
 						T maxVal = (uint32_t(1) << tileBpp) - 1;
 
-						if (tileSize == 2 && tileBpp == 1)
-						{
-							uint8_t tile = ((*(uint8_t *)(buf.data() + tileOffset + sizeof(T))) & 0xf0) >> 4;
+						tileOffset += sizeof(uint8_t);
 
+						T minValue = 0;
+						if (sizeof(T) * 8 != tileBpp || allTilePixelsSame)
+						{
+							minValue = *(T *)(buf.data() + tileOffset);
+							tileOffset += sizeof(T);
+						}
+
+						auto loadTileSameBpp = [&]<typename D>()
+						{
 							uint32_t counter = 0;
 							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
 							{
 								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
 								{
-									uint8_t pixel = minValue + (tile >> counter++) & maxVal;
-									pixels[(yb * width + xb) * channels + c] = pixel;
+									D currData = *(D *)(buf.data() + tileOffset + (counter >> 3));
+
+									pixels[(yb * width + xb) * channels + c] = currData;
+
+									counter += tileBpp;
 								}
 							}
+						};
 
-							tileOffset += sizeof(T) + sizeof(uint8_t);
+						auto decompressTile = [&]<typename D>()
+						{
+							uint32_t counter = 0;
+							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+							{
+								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
+								{
+									D currData = *(D *)(buf.data() + tileOffset + (counter >> 3));
+									D diff = (currData >> (counter % (sizeof(D) * 8))) & maxVal;
+
+									T pixel = minValue + diff;
+									pixels[(yb * width + xb) * channels + c] = pixel;
+
+									counter += tileBpp;
+								}
+							}
+						};
+
+						if (allTilePixelsSame)
+						{
+							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+							{
+								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
+								{
+									pixels[(yb * width + xb) * channels + c] = minValue;
+								}
+							}
 						}
 						else
 						{
-							auto decompressTile = [&]<typename D>()
-							{
-								uint32_t counter = 0;
-								for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
-								{
-									for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-									{
-										D currData = *(D *)(buf.data() + tileOffset + sizeof(T) + sizeof(uint8_t) + (counter >> 3));
-										D diff = (currData >> (counter % (sizeof(D) * 8))) & maxVal;
-										T pixel = minValue + diff;
-										pixels[(yb * width + xb) * channels + c] = pixel;
-
-										counter += tileBpp;
-									}
-								}
-							};
-
 							if (tileBpp <= 8)
 							{
-								decompressTile.template operator()<uint8_t>();
+								if (sizeof(T) * 8 != tileBpp)
+								{
+									decompressTile.template operator()<uint8_t>();
+								}
+								else
+								{
+									loadTileSameBpp.template operator()<uint8_t>();
+								}
 							}
 							else
 							{
-								decompressTile.template operator()<uint16_t>();
+								if (sizeof(T) * 8 != tileBpp)
+								{
+									decompressTile.template operator()<uint16_t>();
+								}
+								else
+								{
+									loadTileSameBpp.template operator()<uint16_t>();
+								}
 							}
 
-							tileOffset += sizeof(T) + sizeof(uint8_t) + ((tileSize * tileSize * tileBpp) >> 3);
+							tileOffset += ((tileSize * tileSize * tileBpp) >> 3);
 						}
 					}
 				}
@@ -163,21 +199,28 @@ public:
 		}
 	}
 
-	template<typename T>
-	void compressImage(std::vector<uint8_t> &resBuf, const T *data, uint32_t bitDepthPerChannel, uint32_t channels, uint32_t width, uint32_t height, uint32_t tileSize)
+	template <typename T>
+	void compressImage(std::vector<uint8_t> &resBuf, const T *data, uint32_t length, uint32_t bitDepthPerChannel, uint32_t channels, uint32_t width, uint32_t height, uint32_t tileSize)
 	{
+		assert(width * height * channels * sizeof(T) == length);
+		assert(tileSize >= 4);
+		assert(data);
+		assert(bitDepthPerChannel <= 64);
+
 		auto start = std::chrono::system_clock::now();
 
-		resBuf.reserve(width * height * channels * (bitDepthPerChannel <= 8 ? 1 : 2) + 5 * sizeof(uint32_t));
+		resBuf.reserve(width * height * channels * sizeof(T) + 5 * sizeof(uint32_t));
 
 		// write out metadata
-		resBuf.resize(5 * sizeof(uint32_t));
+		resBuf.resize(2 * sizeof(uint32_t) + sizeof(uint16_t));
 		uint32_t *ptr32 = (uint32_t *)resBuf.data();
+		uint16_t *ptr16 = (uint16_t *)resBuf.data();
 		ptr32[0] = width;
 		ptr32[1] = height;
-		ptr32[2] = channels;
-		ptr32[3] = bitDepthPerChannel;
-		ptr32[4] = tileSize;
+
+		ptr16[4] = (bitDepthPerChannel - 1) & 0x3f | // 6 bits: 1...64
+				   ((tileSize - 1) & 0x3f) << 6 |	 // 6 bits: 4...64
+				   ((channels - 1) & 0xf) << 12;	 // 4 bits  1...16
 
 		std::chrono::microseconds minmaxSearchTime = std::chrono::microseconds(0);
 		std::chrono::microseconds storeTime = std::chrono::microseconds(0);
@@ -262,75 +305,99 @@ public:
 
 					T maxVal = (uint32_t(1) << tileBpp) - 1;
 
-					uint32_t currSize = resBuf.size();
-					if (tileBpp == 1 && tileSize == 2)
+					uint32_t currOffset = resBuf.size();
+					resBuf.resize(resBuf.size() + sizeof(uint8_t));
+
+					bool allTilePixelsSame = minValue[c] == maxValue[c];
+					bool fullOrDiffFrame = false; // TODO
+
+					*(uint8_t *)(resBuf.data() + currOffset) =
+						((tileBpp - 1) & 0x3f) |		   // bpp stored in lower 6 bits
+						((allTilePixelsSame & 0x1) << 6) | // all tile pixels are the same flag 1 bit
+						((fullOrDiffFrame & 0x1) << 7);	   // reserved for full frame or diff frame 1 bit
+
+					currOffset += sizeof(uint8_t);
+
+					// only write out minValue if input BPP != output BPP
+					// OR all pixels the same (we need still need one)
+					if ((sizeof(T) * 8) != tileBpp || allTilePixelsSame)
 					{
-						resBuf.resize(currSize + sizeof(uint8_t) + sizeof(T));
+						resBuf.resize(resBuf.size() + sizeof(T));
+						*(T *)(resBuf.data() + currOffset) = minValue[c];
+						currOffset += sizeof(T);
 					}
-					else
+
+					// skip writing out any more values if all tile pixels are the same
+					if (allTilePixelsSame)
+						continue;
+
+					// allocate tile pixels
+					resBuf.resize(resBuf.size() + ((tileSize * tileSize * tileBpp) >> 3));
+
+					auto storeTileSameBpp = [&]<typename D>()
 					{
-						resBuf.resize(currSize + ((tileSize * tileSize * tileBpp) >> 3) + sizeof(uint8_t) + sizeof(T));
-					}
-
-					*(T *)(resBuf.data() + currSize) = minValue[c];
-					*(uint8_t *)(resBuf.data() + currSize + sizeof(T)) = (tileBpp - 1) & 0xf; // bpp stored in lower 4 bits
-
-					// we support 2x2 tiles if we store the req bit depth in 4 bits
-					// and in case of a 1bpp tile store the tile in the next 4 bits
-					// as a special case...
-					if (tileBpp == 1 && tileSize == 2)
-					{
-						uint8_t *tileData = (uint8_t *)(resBuf.data() + currSize + sizeof(T));
-
 						uint32_t counter = 0;
 						for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
 						{
 							for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
 							{
-								// T pixel = pixels[(yb * width + xb) * channels + c];
 								T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
-								uint8_t pixelDiff = pixel - minValue[c];
-								uint8_t dataToStore = (pixelDiff & maxVal) << (4 + counter++);
-								*tileData = *tileData | dataToStore; // store data in upper 4 bits
+
+								D *currData = (D *)(resBuf.data() + currOffset + (counter >> 3));
+
+								*currData = pixel;
+
+								counter += tileBpp;
 							}
 						}
-					}
-					else
+					};
+
+					auto compressTile = [&]<typename D>()
 					{
-						auto compressTile = [&]<typename D>()
+						uint32_t counter = 0;
+						for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
 						{
-							uint32_t counter = 0;
-							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+							for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
 							{
-								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
+								T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
+								T pixelDiff = pixel - minValue[c];
+
+								D *currData = (D *)(resBuf.data() + currOffset + (counter >> 3));
+
+								if (counter % (sizeof(D) * 8) == 0)
 								{
-									// T pixel = pixels[(yb * width + xb) * channels + c];
-									T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
-									T pixelDiff = pixel - minValue[c];
-
-									D *currData = (D *)(resBuf.data() + currSize + sizeof(T) + sizeof(uint8_t) + (counter >> 3));
-
-									if (counter % (sizeof(D) * 8) == 0)
-									{
-										*currData = 0;
-									}
-
-									D dataToStore = D(pixelDiff & maxVal) << (counter % (sizeof(D) * 8));
-
-									*currData = *currData | dataToStore;
-
-									counter += tileBpp;
+									*currData = 0;
 								}
-							}
-						};
 
-						if (tileBpp <= 8)
+								D dataToStore = D(pixelDiff & maxVal) << (counter % (sizeof(D) * 8));
+
+								*currData = *currData | dataToStore;
+
+								counter += tileBpp;
+							}
+						}
+					};
+
+					if (tileBpp <= 8)
+					{
+						if ((sizeof(T) * 8) != tileBpp)
 						{
 							compressTile.template operator()<uint8_t>();
 						}
 						else
 						{
+							storeTileSameBpp.template operator()<uint8_t>();
+						}
+					}
+					else
+					{
+						if ((sizeof(T) * 8) != tileBpp)
+						{
 							compressTile.template operator()<uint16_t>();
+						}
+						else
+						{
+							storeTileSameBpp.template operator()<uint16_t>();
 						}
 					}
 				}
@@ -348,7 +415,7 @@ public:
 			std::cout << "Min/max search elapsed time: " << minmaxSearchTime << std::endl;
 			std::cout << "Store elapsed time: " << storeTime << std::endl;
 			std::cout << "Compression elapsed time: " << elapsed << std::endl;
-			uint32_t inputSize = (width * height * channels * (bitDepthPerChannel <=8 ? 1 : 2));
+			uint32_t inputSize = (width * height * channels * (bitDepthPerChannel <= 8 ? 1 : 2));
 			std::cout << "Input size: " << inputSize << " bytes" << std::endl;
 			std::cout << "Output size: " << resBuf.size() << " bytes" << std::endl;
 			std::cout << "Compression ratio: " << uint32_t(float(resBuf.size()) / float(inputSize) * 100.0f) << "% of original" << std::endl;
