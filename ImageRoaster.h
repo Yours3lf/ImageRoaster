@@ -22,7 +22,6 @@
 // If diff between current tile and seq 0 becomes too big (eg bigger bit per pixel requirement than tile seq 0), reset seq to 0 and set full frame
 
 // TODO:
-//-implement phase 2 where instead of next pow2 bit depths are used, exact bit depths are used
 //-implement temporal compression
 
 class ImageRoaster
@@ -118,24 +117,6 @@ public:
 							}
 						};
 
-						auto decompressTile = [&]<typename D>()
-						{
-							uint32_t counter = 0;
-							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
-							{
-								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-								{
-									D currData = *(D *)(buf.data() + tileOffset + (counter >> 3));
-									D diff = (currData >> (counter % (sizeof(D) * 8))) & maxVal;
-
-									T pixel = minValue + diff;
-									pixels[(yb * width + xb) * channels + c] = pixel;
-
-									counter += tileBpp;
-								}
-							}
-						};
-
 						if (allTilePixelsSame)
 						{
 							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
@@ -148,22 +129,40 @@ public:
 						}
 						else
 						{
-							if (tileBpp <= 8)
+							if (sizeof(T) * 8 != tileBpp)
 							{
-								if (sizeof(T) * 8 != tileBpp)
+								uint32_t counter = 0;
+								for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
 								{
-									decompressTile.template operator()<uint8_t>();
-								}
-								else
-								{
-									loadTileSameBpp.template operator()<uint8_t>();
+									for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
+									{
+										T pixelDiff = 0;
+
+										uint32_t bitsLeftToRead = tileBpp;
+
+										while (bitsLeftToRead > 0)
+										{
+											uint8_t currByte = *(uint8_t *)(buf.data() + tileOffset + (counter >> 3));
+
+											uint32_t bitsToRead = std::min(bitsLeftToRead, 8 - (counter % 8));
+											uint32_t bitsToReadMask = (uint32_t(1) << bitsToRead) - 1;
+
+											pixelDiff |= ((currByte >> (counter % 8)) & bitsToReadMask) << (tileBpp - bitsLeftToRead);
+
+											counter += bitsToRead;
+											bitsLeftToRead -= bitsToRead;
+										}
+
+										T pixel = minValue + (pixelDiff & maxVal);
+										pixels[(yb * width + xb) * channels + c] = pixel;
+									}
 								}
 							}
 							else
 							{
-								if (sizeof(T) * 8 != tileBpp)
+								if (tileBpp <= 8)
 								{
-									decompressTile.template operator()<uint16_t>();
+									loadTileSameBpp.template operator()<uint8_t>();
 								}
 								else
 								{
@@ -171,7 +170,8 @@ public:
 								}
 							}
 
-							tileOffset += ((tileSize * tileSize * tileBpp) >> 3);
+							uint32_t tileSizeBits = (tileSize * tileSize * tileBpp);
+							tileOffset += (tileSizeBits >> 3) + ((tileSizeBits % 8) > 0);
 						}
 					}
 				}
@@ -300,7 +300,7 @@ public:
 							return v;
 						};
 
-						tileBpp = nextPow2(tileBpp);
+						// tileBpp = nextPow2(tileBpp);
 					}
 
 					T maxVal = (uint32_t(1) << tileBpp) - 1;
@@ -332,9 +332,10 @@ public:
 						continue;
 
 					// allocate tile pixels
-					resBuf.resize(resBuf.size() + ((tileSize * tileSize * tileBpp) >> 3));
+					uint32_t tileSizeBits = (tileSize * tileSize * tileBpp);
+					resBuf.resize(resBuf.size() + (tileSizeBits >> 3) + ((tileSizeBits % 8) > 0));
 
-					auto storeTileSameBpp = [&]<typename D>()
+					if ((sizeof(T) * 8) != tileBpp)
 					{
 						uint32_t counter = 0;
 						for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
@@ -342,58 +343,56 @@ public:
 							for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
 							{
 								T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
+								T pixelDiff = (pixel - minValue[c]) & maxVal;
 
-								D *currData = (D *)(resBuf.data() + currOffset + (counter >> 3));
+								uint32_t bitsLeftToWrite = tileBpp;
 
-								*currData = pixel;
-
-								counter += tileBpp;
-							}
-						}
-					};
-
-					auto compressTile = [&]<typename D>()
-					{
-						uint32_t counter = 0;
-						for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
-						{
-							for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-							{
-								T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
-								T pixelDiff = pixel - minValue[c];
-
-								D *currData = (D *)(resBuf.data() + currOffset + (counter >> 3));
-
-								if (counter % (sizeof(D) * 8) == 0)
+								while (bitsLeftToWrite > 0)
 								{
-									*currData = 0;
+									uint8_t *currByte = (uint8_t *)(resBuf.data() + currOffset + (counter >> 3));
+
+									if ((counter % 8) == 0)
+									{
+										*currByte = 0;
+									}
+
+									uint32_t bitsToWrite = std::min(bitsLeftToWrite, 8 - (counter % 8));
+									uint32_t bitsToWriteMask = (uint32_t(1) << bitsToWrite) - 1;
+
+									uint8_t dataToStore = (pixelDiff & bitsToWriteMask) << (counter % 8);
+
+									*currByte |= dataToStore;
+
+									counter += bitsToWrite;
+									bitsLeftToWrite -= bitsToWrite;
+									pixelDiff >>= bitsToWrite;
 								}
-
-								D dataToStore = D(pixelDiff & maxVal) << (counter % (sizeof(D) * 8));
-
-								*currData = *currData | dataToStore;
-
-								counter += tileBpp;
 							}
-						}
-					};
-
-					if (tileBpp <= 8)
-					{
-						if ((sizeof(T) * 8) != tileBpp)
-						{
-							compressTile.template operator()<uint8_t>();
-						}
-						else
-						{
-							storeTileSameBpp.template operator()<uint8_t>();
 						}
 					}
 					else
 					{
-						if ((sizeof(T) * 8) != tileBpp)
+						auto storeTileSameBpp = [&]<typename D>()
 						{
-							compressTile.template operator()<uint16_t>();
+							uint32_t counter = 0;
+							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+							{
+								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
+								{
+									T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
+
+									D *currData = (D *)(resBuf.data() + currOffset + (counter >> 3));
+
+									*currData = pixel;
+
+									counter += tileBpp;
+								}
+							}
+						};
+
+						if (tileBpp <= 8)
+						{
+							storeTileSameBpp.template operator()<uint8_t>();
 						}
 						else
 						{
