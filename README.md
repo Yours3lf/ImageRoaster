@@ -10,9 +10,9 @@ It works on a very simple principle:
 ## Advantages
  1. It is able to achieve quite a high compression ratio. 
 In my limited testing it was able to achieve a 25% compression ratio (2.98MB -> 0.75MB) on a 0.75MPix RGBA8 image. With the same picture:
-	 - PNG achieves a 32% ratio (0.96MB).
-     - WEBP achieves a 22% ratio (0.66MB)
-     - JPEGXL achieves a 19% ratio (0.58MB)
+	 - PNG achieves a 18% ratio (0.54MB).
+     - WEBP achieves a 11% ratio (0.33MB)
+     - JPEGXL achieves a 11% ratio (0.34MB)
  3. It is incredibly fast, compresses image the above image in ~90 milliseconds on mobile hardware (probably room to improve though)
 
 ## Drawbacks
