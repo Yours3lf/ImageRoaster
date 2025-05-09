@@ -224,6 +224,7 @@ public:
 
 		std::chrono::microseconds minmaxSearchTime = std::chrono::microseconds(0);
 		std::chrono::microseconds storeTime = std::chrono::microseconds(0);
+		std::chrono::microseconds metadataTime = std::chrono::microseconds(0);
 
 		const T *pixels = (const T *)data;
 
@@ -271,10 +272,10 @@ public:
 				auto minmaxSearchEnd = std::chrono::system_clock::now();
 				minmaxSearchTime += std::chrono::duration_cast<std::chrono::microseconds>(minmaxSearchEnd - minmaxSearchStart);
 
-				auto storeStart = std::chrono::system_clock::now();
-
 				for (uint32_t c = 0; c < channels; c++)
 				{
+					auto metadataStart = std::chrono::system_clock::now();
+
 					uint32_t tileBpp = 0;
 					{
 						uint32_t diff = maxValue[c] - minValue[c];
@@ -327,13 +328,20 @@ public:
 						currOffset += sizeof(T);
 					}
 
+					auto metadataEnd = std::chrono::system_clock::now();
+					metadataTime += std::chrono::duration_cast<std::chrono::microseconds>(metadataEnd - metadataStart);
+
 					// skip writing out any more values if all tile pixels are the same
 					if (allTilePixelsSame)
 						continue;
 
+					auto storeStart = std::chrono::system_clock::now();
+
 					// allocate tile pixels
 					uint32_t tileSizeBits = (tileSize * tileSize * tileBpp);
+					uint32_t offset = resBuf.size();
 					resBuf.resize(resBuf.size() + (tileSizeBits >> 3) + ((tileSizeBits % 8) > 0));
+					memset(resBuf.data() + offset, 0, resBuf.size() - offset);
 
 					if ((sizeof(T) * 8) != tileBpp)
 					{
@@ -350,11 +358,6 @@ public:
 								while (bitsLeftToWrite > 0)
 								{
 									uint8_t *currByte = (uint8_t *)(resBuf.data() + currOffset + (counter >> 3));
-
-									if ((counter % 8) == 0)
-									{
-										*currByte = 0;
-									}
 
 									uint32_t bitsToWrite = std::min(bitsLeftToWrite, 8 - (counter % 8));
 									uint32_t bitsToWriteMask = (uint32_t(1) << bitsToWrite) - 1;
@@ -399,10 +402,10 @@ public:
 							storeTileSameBpp.template operator()<uint16_t>();
 						}
 					}
-				}
 
-				auto storeEnd = std::chrono::system_clock::now();
-				storeTime += std::chrono::duration_cast<std::chrono::microseconds>(storeEnd - storeStart);
+					auto storeEnd = std::chrono::system_clock::now();
+					storeTime += std::chrono::duration_cast<std::chrono::microseconds>(storeEnd - storeStart);
+				}
 			}
 		}
 
@@ -412,8 +415,9 @@ public:
 		if (profiling)
 		{
 			std::cout << "Min/max search elapsed time: " << minmaxSearchTime << std::endl;
+			std::cout << "Metadata elapsed time: " << metadataTime << std::endl;
 			std::cout << "Store elapsed time: " << storeTime << std::endl;
-			std::cout << "Compression elapsed time: " << elapsed << std::endl;
+			std::cout << "Total elapsed time: " << elapsed << std::endl;
 			uint32_t inputSize = (width * height * channels * (bitDepthPerChannel <= 8 ? 1 : 2));
 			std::cout << "Input size: " << inputSize << " bytes" << std::endl;
 			std::cout << "Output size: " << resBuf.size() << " bytes" << std::endl;
