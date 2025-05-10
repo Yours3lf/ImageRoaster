@@ -222,10 +222,6 @@ public:
 				   ((tileSize - 1) & 0x3f) << 6 |	 // 6 bits: 4...64
 				   ((channels - 1) & 0xf) << 12;	 // 4 bits  1...16
 
-		std::chrono::microseconds minmaxSearchTime = std::chrono::microseconds(0);
-		std::chrono::microseconds storeTime = std::chrono::microseconds(0);
-		std::chrono::microseconds metadataTime = std::chrono::microseconds(0);
-
 		const T *pixels = (const T *)data;
 
 		// we cache tile pixels during minmax value search so that we don't pay cache misses twice
@@ -241,8 +237,6 @@ public:
 		{
 			for (uint32_t x = 0; x < width; x += tileSize)
 			{
-				auto minmaxSearchStart = std::chrono::system_clock::now();
-
 				// figure out smallest and largest value per channel
 				T minValue[channels];
 				T maxValue[channels];
@@ -269,13 +263,8 @@ public:
 					}
 				}
 
-				auto minmaxSearchEnd = std::chrono::system_clock::now();
-				minmaxSearchTime += std::chrono::duration_cast<std::chrono::microseconds>(minmaxSearchEnd - minmaxSearchStart);
-
 				for (uint32_t c = 0; c < channels; c++)
 				{
-					auto metadataStart = std::chrono::system_clock::now();
-
 					uint32_t tileBpp = 0;
 					{
 						uint32_t diff = maxValue[c] - minValue[c];
@@ -328,14 +317,9 @@ public:
 						currOffset += sizeof(T);
 					}
 
-					auto metadataEnd = std::chrono::system_clock::now();
-					metadataTime += std::chrono::duration_cast<std::chrono::microseconds>(metadataEnd - metadataStart);
-
 					// skip writing out any more values if all tile pixels are the same
 					if (allTilePixelsSame)
 						continue;
-
-					auto storeStart = std::chrono::system_clock::now();
 
 					// allocate tile pixels
 					uint32_t tileSizeBits = (tileSize * tileSize * tileBpp);
@@ -402,9 +386,6 @@ public:
 							storeTileSameBpp.template operator()<uint16_t>();
 						}
 					}
-
-					auto storeEnd = std::chrono::system_clock::now();
-					storeTime += std::chrono::duration_cast<std::chrono::microseconds>(storeEnd - storeStart);
 				}
 			}
 		}
@@ -414,9 +395,6 @@ public:
 
 		if (profiling)
 		{
-			std::cout << "Min/max search elapsed time: " << minmaxSearchTime << std::endl;
-			std::cout << "Metadata elapsed time: " << metadataTime << std::endl;
-			std::cout << "Store elapsed time: " << storeTime << std::endl;
 			std::cout << "Total elapsed time: " << elapsed << std::endl;
 			uint32_t inputSize = (width * height * channels * (bitDepthPerChannel <= 8 ? 1 : 2));
 			std::cout << "Input size: " << inputSize << " bytes" << std::endl;
