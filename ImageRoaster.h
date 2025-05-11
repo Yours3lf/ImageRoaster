@@ -252,13 +252,14 @@ public:
 		std::vector<T> strideCache;
 		strideCache.resize(tileSize * channels);
 
+        std::vector<T> minValue(channels);
+        std::vector<T> maxValue(channels);
+
 		for (uint32_t y = 0; y < height; y += tileSize)
 		{
 			for (uint32_t x = 0; x < width; x += tileSize)
 			{
 				// figure out smallest and largest value per channel
-				std::vector<T> minValue(channels);
-				std::vector<T> maxValue(channels);
 				for (uint32_t c = 0; c < channels; ++c)
 				{
 					minValue[c] = ~T(0);
