@@ -83,97 +83,95 @@ public:
 			{
 				for (uint32_t x = 0; x < width; x += tileSize)
 				{
+					uint32_t tileBpp[channels];
+					bool allTilePixelsSame[channels];
+					bool fullOrDiffFrame[channels];
+					T maxVal[channels];
+
 					for (uint32_t c = 0; c < channels; ++c)
 					{
 						uint8_t metadata = *(uint8_t *)(buf.data() + tileOffset);
-						uint32_t tileBpp = (metadata & 0x3f) + 1;
-						bool allTilePixelsSame = (metadata >> 6) & 0x1;
-						bool fullOrDiffFrame = (metadata >> 7) & 0x1;
+						tileBpp[c] = (metadata & 0x3f) + 1;
+						allTilePixelsSame[c] = (metadata >> 6) & 0x1;
+						fullOrDiffFrame[c] = (metadata >> 7) & 0x1;
 
-						T maxVal = (uint32_t(1) << tileBpp) - 1;
+						maxVal[c] = (uint32_t(1) << tileBpp[c]) - 1;
 
 						tileOffset += sizeof(uint8_t);
+					}
 
-						T minValue = 0;
-						if (sizeof(T) * 8 != tileBpp || allTilePixelsSame)
+					T minValue[channels];
+					for (uint32_t c = 0; c < channels; ++c)
+					{
+						if (sizeof(T) * 8 != tileBpp[c] || allTilePixelsSame[c])
 						{
-							minValue = *(T *)(buf.data() + tileOffset);
+							minValue[c] = *(T *)(buf.data() + tileOffset);
 							tileOffset += sizeof(T);
 						}
+					}
 
-						auto loadTileSameBpp = [&]<typename D>()
+					auto readBits = [&](uint32_t& counter, uint32_t c)
+					{
+						T data = 0;
+
+						uint32_t bitsLeftToRead = tileBpp[c];
+
+						while (bitsLeftToRead > 0)
 						{
-							uint32_t counter = 0;
-							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
-							{
-								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-								{
-									D currData = *(D *)(buf.data() + tileOffset + (counter >> 3));
+							uint8_t currByte = *(uint8_t *)(buf.data() + tileOffset + (counter >> 3));
 
-									pixels[(yb * width + xb) * channels + c] = currData;
+							uint32_t bitsToRead = std::min(bitsLeftToRead, 8 - (counter % 8));
+							uint32_t bitsToReadMask = (uint32_t(1) << bitsToRead) - 1;
 
-									counter += tileBpp;
-								}
-							}
-						};
+							data |= ((currByte >> (counter % 8)) & bitsToReadMask) << (tileBpp[c] - bitsLeftToRead);
 
-						if (allTilePixelsSame)
-						{
-							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
-							{
-								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-								{
-									pixels[(yb * width + xb) * channels + c] = minValue;
-								}
-							}
+							counter += bitsToRead;
+							bitsLeftToRead -= bitsToRead;
 						}
-						else
+
+						return data;
+					};
+
+					uint32_t counter = 0;
+					for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+					{
+						for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
 						{
-							if (sizeof(T) * 8 != tileBpp)
+							for (uint32_t c = 0; c < channels; ++c)
 							{
-								uint32_t counter = 0;
-								for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+								if (allTilePixelsSame[c])
 								{
-									for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-									{
-										T pixelDiff = 0;
-
-										uint32_t bitsLeftToRead = tileBpp;
-
-										while (bitsLeftToRead > 0)
-										{
-											uint8_t currByte = *(uint8_t *)(buf.data() + tileOffset + (counter >> 3));
-
-											uint32_t bitsToRead = std::min(bitsLeftToRead, 8 - (counter % 8));
-											uint32_t bitsToReadMask = (uint32_t(1) << bitsToRead) - 1;
-
-											pixelDiff |= ((currByte >> (counter % 8)) & bitsToReadMask) << (tileBpp - bitsLeftToRead);
-
-											counter += bitsToRead;
-											bitsLeftToRead -= bitsToRead;
-										}
-
-										T pixel = minValue + (pixelDiff & maxVal);
-										pixels[(yb * width + xb) * channels + c] = pixel;
-									}
+									pixels[(yb * width + xb) * channels + c] = minValue[c];
+									continue;
 								}
-							}
-							else
-							{
-								if (tileBpp <= 8)
+
+								T pixel = 0;
+
+								if (sizeof(T) * 8 != tileBpp[c])
 								{
-									loadTileSameBpp.template operator()<uint8_t>();
+									T pixelDiff = readBits(counter, c);
+
+									pixel = minValue[c] + (pixelDiff & maxVal[c]);
 								}
 								else
 								{
-									loadTileSameBpp.template operator()<uint16_t>();
+									pixel = readBits(counter, c);
 								}
-							}
 
-							uint32_t tileSizeBits = (tileSize * tileSize * tileBpp);
-							tileOffset += (tileSizeBits >> 3) + ((tileSizeBits % 8) > 0);
+								pixels[(yb * width + xb) * channels + c] = pixel;
+							}
 						}
 					}
+
+					uint32_t tileSizeBits = 0;
+					for (uint32_t c = 0; c < channels; ++c)
+					{
+						if (!allTilePixelsSame[c])
+						{
+							tileSizeBits += (tileSize * tileSize * tileBpp[c]);
+						}
+					}
+					tileOffset += (tileSizeBits >> 3) + ((tileSizeBits % 8) > 0);
 				}
 			}
 		};
@@ -263,20 +261,30 @@ public:
 					}
 				}
 
+				auto minmaxSearchEnd = std::chrono::system_clock::now();
+				minmaxSearchTime += std::chrono::duration_cast<std::chrono::microseconds>(minmaxSearchEnd - minmaxSearchStart);
+
+				auto storeStart = std::chrono::system_clock::now();
+
+				uint32_t tileBpp[channels];
+				T maxVal[channels];
+				bool allTilePixelsSame[channels];
+				bool fullOrDiffFrame[channels];
+
 				for (uint32_t c = 0; c < channels; c++)
 				{
-					uint32_t tileBpp = 0;
+					tileBpp[c] = 0;
 					{
 						uint32_t diff = maxValue[c] - minValue[c];
 
 						while (diff != 0)
 						{
 							diff >>= 1;
-							tileBpp++;
+							tileBpp[c]++;
 						}
 
-						if (tileBpp == 0)
-							tileBpp = 1;
+						if (tileBpp[c] == 0)
+							tileBpp[c] = 1;
 
 						auto nextPow2 = [](uint32_t v)
 						{
@@ -293,97 +301,97 @@ public:
 						// tileBpp = nextPow2(tileBpp);
 					}
 
-					T maxVal = (uint32_t(1) << tileBpp) - 1;
+					maxVal[c] = (uint32_t(1) << tileBpp[c]) - 1;
 
-					uint32_t currOffset = resBuf.size();
-					resBuf.resize(resBuf.size() + sizeof(uint8_t));
+					allTilePixelsSame[c] = minValue[c] == maxValue[c];
+					fullOrDiffFrame[c] = false; // TODO
+				}
 
-					bool allTilePixelsSame = minValue[c] == maxValue[c];
-					bool fullOrDiffFrame = false; // TODO
+				uint32_t currOffset = resBuf.size();
+				resBuf.resize(resBuf.size() + sizeof(uint8_t) * channels);
 
-					*(uint8_t *)(resBuf.data() + currOffset) =
-						((tileBpp - 1) & 0x3f) |		   // bpp stored in lower 6 bits
-						((allTilePixelsSame & 0x1) << 6) | // all tile pixels are the same flag 1 bit
-						((fullOrDiffFrame & 0x1) << 7);	   // reserved for full frame or diff frame 1 bit
+				for (uint32_t c = 0; c < channels; ++c)
+				{
+					*(uint8_t *)(resBuf.data() + currOffset + c) =
+						((tileBpp[c] - 1) & 0x3f) |			  // bpp stored in lower 6 bits
+						((allTilePixelsSame[c] & 0x1) << 6) | // all tile pixels are the same flag 1 bit
+						((fullOrDiffFrame[c] & 0x1) << 7);	  // reserved for full frame or diff frame 1 bit
 
 					currOffset += sizeof(uint8_t);
+				}
 
+				for (uint32_t c = 0; c < channels; ++c)
+				{
 					// only write out minValue if input BPP != output BPP
 					// OR all pixels the same (we need still need one)
-					if ((sizeof(T) * 8) != tileBpp || allTilePixelsSame)
+					if ((sizeof(T) * 8) != tileBpp[c] || allTilePixelsSame[c])
 					{
 						resBuf.resize(resBuf.size() + sizeof(T));
 						*(T *)(resBuf.data() + currOffset) = minValue[c];
 						currOffset += sizeof(T);
 					}
+				}
 
-					// skip writing out any more values if all tile pixels are the same
-					if (allTilePixelsSame)
-						continue;
-
-					// allocate tile pixels
-					uint32_t tileSizeBits = (tileSize * tileSize * tileBpp);
-					uint32_t offset = resBuf.size();
-					resBuf.resize(resBuf.size() + (tileSizeBits >> 3) + ((tileSizeBits % 8) > 0));
-					memset(resBuf.data() + offset, 0, resBuf.size() - offset);
-
-					if ((sizeof(T) * 8) != tileBpp)
+				// allocate tile pixels
+				uint32_t tileSizeBits = 0;
+				for (uint32_t c = 0; c < channels; ++c)
+				{
+					if (!allTilePixelsSame[c])
 					{
-						uint32_t counter = 0;
-						for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
-						{
-							for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-							{
-								T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
-								T pixelDiff = (pixel - minValue[c]) & maxVal;
-
-								uint32_t bitsLeftToWrite = tileBpp;
-
-								while (bitsLeftToWrite > 0)
-								{
-									uint8_t *currByte = (uint8_t *)(resBuf.data() + currOffset + (counter >> 3));
-
-									uint32_t bitsToWrite = std::min(bitsLeftToWrite, 8 - (counter % 8));
-									uint32_t bitsToWriteMask = (uint32_t(1) << bitsToWrite) - 1;
-
-									uint8_t dataToStore = (pixelDiff & bitsToWriteMask) << (counter % 8);
-
-									*currByte |= dataToStore;
-
-									counter += bitsToWrite;
-									bitsLeftToWrite -= bitsToWrite;
-									pixelDiff >>= bitsToWrite;
-								}
-							}
-						}
+						tileSizeBits += (tileSize * tileSize * tileBpp[c]);
 					}
-					else
+				}
+				resBuf.resize(resBuf.size() + (tileSizeBits >> 3) + ((tileSizeBits % 8) > 0));
+
+				auto writeBits = [&](T data, uint32_t& counter, uint32_t c)
+				{
+					uint32_t bitsLeftToWrite = tileBpp[c];
+
+					while (bitsLeftToWrite > 0)
 					{
-						auto storeTileSameBpp = [&]<typename D>()
+						uint8_t *currByte = (uint8_t *)(resBuf.data() + currOffset + (counter >> 3));
+
+						if ((counter % 8) == 0)
 						{
-							uint32_t counter = 0;
-							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
-							{
-								for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
-								{
-									T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
-
-									D *currData = (D *)(resBuf.data() + currOffset + (counter >> 3));
-
-									*currData = pixel;
-
-									counter += tileBpp;
-								}
-							}
-						};
-
-						if (tileBpp <= 8)
-						{
-							storeTileSameBpp.template operator()<uint8_t>();
+							*currByte = 0;
 						}
-						else
+
+						uint32_t bitsToWrite = std::min(bitsLeftToWrite, 8 - (counter % 8));
+						uint32_t bitsToWriteMask = (uint32_t(1) << bitsToWrite) - 1;
+
+						uint8_t dataToStore = (data & bitsToWriteMask) << (counter % 8);
+
+						*currByte |= dataToStore;
+
+						counter += bitsToWrite;
+						bitsLeftToWrite -= bitsToWrite;
+						data >>= bitsToWrite;
+					}
+				};
+
+				uint32_t counter = 0;
+				for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
+				{
+					for (uint32_t xx = 0, xb = x; xx < tileSize && xb < width; ++xx, ++xb)
+					{
+						for (uint32_t c = 0; c < channels; ++c)
 						{
-							storeTileSameBpp.template operator()<uint16_t>();
+							// skip writing out any more values if all tile pixels are the same
+							if (allTilePixelsSame[c])
+								continue;
+
+							T pixel = tilePixels[(yy * tileSize + xx) * channels + c];
+
+							if ((sizeof(T) * 8) != tileBpp[c])
+							{
+								T pixelDiff = (pixel - minValue[c]) & maxVal[c];
+
+								writeBits(pixelDiff, counter, c);
+							}
+							else
+							{
+								writeBits(pixel, counter, c);
+							}
 						}
 					}
 				}
