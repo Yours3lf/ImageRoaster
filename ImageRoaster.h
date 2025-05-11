@@ -26,7 +26,7 @@
 
 class ImageRoaster
 {
-	static const bool profiling = true;
+	static const bool profiling = false;
 
 public:
 	template <typename T>
@@ -50,6 +50,17 @@ public:
 		}
 	}
 
+	void loadImage(const std::string &filename, std::vector<uint8_t>& image) const
+	{
+		std::ifstream f;
+		f.open(filename, std::ios::binary);
+		f.seekg(0, std::ios::end);
+		size_t size = f.tellg();
+		f.seekg(0);
+		image.resize(size);
+		f.read((char*)image.data(), image.size());
+	}
+
 	void saveImage(const std::string &filename, const uint8_t *image, uint32_t length) const
 	{
 		std::ofstream f;
@@ -57,19 +68,25 @@ public:
 		f.write((const char *)image, length);
 	}
 
+	void getCompressedImageMetadata(const std::vector<uint8_t> &buf, uint32_t& width, uint32_t& height, uint32_t& bitDepthPerChannel, uint32_t& tileSize, uint32_t& channels)
+	{
+		uint32_t *ptr32 = (uint32_t *)buf.data();
+		uint16_t *ptr16 = (uint16_t *)buf.data();
+
+		width = ptr32[0];
+		height = ptr32[1];
+
+		bitDepthPerChannel = ((ptr16[4]) & 0x3f) + 1;
+		tileSize = ((ptr16[4] >> 6) & 0x3f) + 1;
+		channels = ((ptr16[4] >> 12) & 0xf) + 1;
+	}
+
 	void decompressImage(const std::vector<uint8_t> &buf, std::vector<uint8_t> &resBuf)
 	{
 		auto start = std::chrono::system_clock::now();
 
-		uint32_t *ptr32 = (uint32_t *)buf.data();
-		uint16_t *ptr16 = (uint16_t *)buf.data();
-
-		uint32_t width = ptr32[0];
-		uint32_t height = ptr32[1];
-
-		uint32_t bitDepthPerChannel = ((ptr16[4]) & 0x3f) + 1;
-		uint32_t tileSize = ((ptr16[4] >> 6) & 0x3f) + 1;
-		uint32_t channels = ((ptr16[4] >> 12) & 0xf) + 1;
+		uint32_t width, height, bitDepthPerChannel, tileSize, channels;
+		getCompressedImageMetadata(buf, width, height, bitDepthPerChannel, tileSize, channels);
 
 		assert(tileSize >= 4);
 
@@ -103,6 +120,8 @@ public:
 
 						auto loadTileSameBpp = [&]<typename D>()
 						{
+                            assert(sizeof(D) >= sizeof(T));
+
 							uint32_t counter = 0;
 							for (uint32_t yy = 0, yb = y; yy < tileSize && yb < height; ++yy, ++yb)
 							{
@@ -238,8 +257,8 @@ public:
 			for (uint32_t x = 0; x < width; x += tileSize)
 			{
 				// figure out smallest and largest value per channel
-				T minValue[channels];
-				T maxValue[channels];
+				std::vector<T> minValue(channels);
+				std::vector<T> maxValue(channels);
 				for (uint32_t c = 0; c < channels; ++c)
 				{
 					minValue[c] = ~T(0);
